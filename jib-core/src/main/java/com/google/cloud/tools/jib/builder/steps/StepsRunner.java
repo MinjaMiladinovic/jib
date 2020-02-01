@@ -1,642 +1,532 @@
 /*
- * Copyright 2018 Google LLC.
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not
- * use this file except in compliance with the License. You may obtain a copy of
- * the License at
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations under
- * the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
-package com.google.cloud.tools.jib.builder.steps;
+package org.apache.iceberg.hive;
 
-import com.google.cloud.tools.jib.api.DescriptorDigest;
-import com.google.cloud.tools.jib.blob.BlobDescriptor;
-import com.google.cloud.tools.jib.builder.ProgressEventDispatcher;
-import com.google.cloud.tools.jib.builder.steps.LocalBaseImageSteps.LocalImage;
-import com.google.cloud.tools.jib.builder.steps.PullBaseImageStep.ImagesAndRegistryClient;
-import com.google.cloud.tools.jib.configuration.BuildContext;
-import com.google.cloud.tools.jib.configuration.ImageConfiguration;
-import com.google.cloud.tools.jib.docker.DockerClient;
-import com.google.cloud.tools.jib.filesystem.TempDirectoryProvider;
-import com.google.cloud.tools.jib.global.JibSystemProperties;
-import com.google.cloud.tools.jib.image.Image;
-import com.google.cloud.tools.jib.image.Layer;
-import com.google.cloud.tools.jib.image.json.ManifestTemplate;
-import com.google.cloud.tools.jib.registry.ManifestAndDigest;
-import com.google.cloud.tools.jib.registry.RegistryClient;
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Verify;
-import com.google.common.collect.ImmutableList;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListeningExecutorService;
-import com.google.common.util.concurrent.MoreExecutors;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
+import java.io.Closeable;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.function.Consumer;
+import java.util.Set;
 import java.util.stream.Collectors;
-import javax.annotation.Nullable;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.conf.HiveConf;
+import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
+import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.InvalidOperationException;
+import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.hadoop.hive.metastore.api.UnknownDBException;
+import org.apache.iceberg.BaseMetastoreCatalog;
+import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.SupportsNamespaces;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.relocated.com.google.common.base.Joiner;
+import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.thrift.TException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * Runs steps for building an image.
- *
- * <p>Use by first calling {@link #begin} and then calling the individual step running methods. Note
- * that order matters, so make sure that steps are run before other steps that depend on them. Wait
- * on the last step by calling the respective {@code wait...} methods.
- */
-public class StepsRunner {
+public class HiveCatalog extends BaseMetastoreCatalog implements Closeable, SupportsNamespaces {
+  private static final Logger LOG = LoggerFactory.getLogger(HiveCatalog.class);
 
-  /** Holds the individual step results. */
-  private static class StepResults {
+  private final String name;
+  private final HiveClientPool clients;
+  private final Configuration conf;
+  private final StackTraceElement[] createStack;
+  private final FileIO fileIO;
+  private boolean closed;
 
-    private static <E> Future<E> failedFuture() {
-      return Futures.immediateFailedFuture(
-          new IllegalStateException("invalid usage; required step not configured"));
+  public HiveCatalog(Configuration conf) {
+    this.name = "hive";
+    this.clients = new HiveClientPool(conf);
+    this.conf = conf;
+    this.createStack = Thread.currentThread().getStackTrace();
+    this.closed = false;
+    this.fileIO = new HadoopFileIO(conf);
+  }
+
+  public HiveCatalog(String name, String uri, int clientPoolSize, Configuration conf) {
+    this(name, uri, null, clientPoolSize, conf);
+  }
+
+  public HiveCatalog(String name, String uri, String warehouse, int clientPoolSize, Configuration conf) {
+    this(name, uri, warehouse, clientPoolSize, conf, Maps.newHashMap());
+  }
+
+  public HiveCatalog(
+      String name,
+      String uri,
+      String warehouse,
+      int clientPoolSize,
+      Configuration conf,
+      Map<String, String> properties) {
+    this.name = name;
+    this.conf = new Configuration(conf);
+    // before building the client pool, overwrite the configuration's URIs if the argument is non-null
+    if (uri != null) {
+      this.conf.set(HiveConf.ConfVars.METASTOREURIS.varname, uri);
     }
 
-    @Nullable private List<Future<PreparedLayer>> applicationLayers;
-    private Future<ManifestTemplate> manifestListOrSingleManifest = failedFuture();
-    private Future<RegistryClient> targetRegistryClient = failedFuture();
-    private Future<List<Future<BlobDescriptor>>> applicationLayerPushResults = failedFuture();
-    private Future<Optional<ManifestAndDigest<ManifestTemplate>>> manifestCheckResult =
-        failedFuture();
-    private Future<List<Future<BuildResult>>> imagePushResults = failedFuture();
-    private Future<BuildResult> buildResult = failedFuture();
-
-    private Future<ImagesAndRegistryClient> baseImagesAndRegistryClient = failedFuture();
-    private Future<Map<Image, List<Future<PreparedLayer>>>> baseImagesAndLayers = failedFuture();
-    private Future<Map<Image, List<Future<BlobDescriptor>>>> baseImagesAndLayerPushResults =
-        failedFuture();
-    private Future<Map<Image, Future<BlobDescriptor>>> baseImagesAndContainerConfigPushResults =
-        failedFuture();
-    private Future<Map<Image, Future<Image>>> baseImagesAndBuiltImages = failedFuture();
-  }
-
-  /**
-   * Starts building the steps to run.
-   *
-   * @param buildContext the {@link BuildContext}
-   * @return a new {@link StepsRunner}
-   */
-  public static StepsRunner begin(BuildContext buildContext) {
-    ExecutorService executorService =
-        JibSystemProperties.serializeExecution()
-            ? MoreExecutors.newDirectExecutorService()
-            : buildContext.getExecutorService();
-
-    return new StepsRunner(MoreExecutors.listeningDecorator(executorService), buildContext);
-  }
-
-  private static <E> List<E> realizeFutures(Collection<Future<E>> futures)
-      throws InterruptedException, ExecutionException {
-    List<E> values = new ArrayList<>();
-    for (Future<E> future : futures) {
-      values.add(future.get());
+    if (warehouse != null) {
+      this.conf.set(HiveConf.ConfVars.METASTOREWAREHOUSE.varname, warehouse);
     }
-    return values;
+
+    this.clients = new HiveClientPool(clientPoolSize, this.conf);
+    this.createStack = Thread.currentThread().getStackTrace();
+    this.closed = false;
+
+    String fileIOImpl = properties.get(CatalogProperties.FILE_IO_IMPL);
+    this.fileIO = fileIOImpl == null ? new HadoopFileIO(conf) : CatalogUtil.loadFileIO(fileIOImpl, properties, conf);
   }
 
-  private final StepResults results = new StepResults();
+  @Override
+  public List<TableIdentifier> listTables(Namespace namespace) {
+    Preconditions.checkArgument(isValidateNamespace(namespace),
+        "Missing database in namespace: %s", namespace);
+    String database = namespace.level(0);
 
-  private final ExecutorService executorService;
-  private final BuildContext buildContext;
-  private final TempDirectoryProvider tempDirectoryProvider = new TempDirectoryProvider();
+    try {
+      List<String> tables = clients.run(client -> client.getAllTables(database));
+      List<TableIdentifier> tableIdentifiers = tables.stream()
+          .map(t -> TableIdentifier.of(namespace, t))
+          .collect(Collectors.toList());
 
-  // Instead of directly running each step, we first save them as a lambda. This is only because of
-  // the unfortunate chicken-and-egg situation when using ProgressEventDispatcher. The current
-  // ProgressEventDispatcher model requires allocating the total units of work (i.e., steps)
-  // up front. That is, to instantiate a root ProgressEventDispatcher, we should know ahead how many
-  // steps we will run. However, to run a step, we need a root progress dispatcher. So, we take each
-  // step as a lambda and save them to run later. Then we can count the number of lambdas, create a
-  // root dispatcher with the count, and run the saved lambdas using the dispatcher.
-  private final List<Consumer<ProgressEventDispatcher.Factory>> stepsToRun = new ArrayList<>();
+      LOG.debug("Listing of namespace: {} resulted in the following tables: {}", namespace, tableIdentifiers);
+      return tableIdentifiers;
 
-  @Nullable private String rootProgressDescription;
+    } catch (UnknownDBException e) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
 
-  @VisibleForTesting
-  StepsRunner(ListeningExecutorService executorService, BuildContext buildContext) {
-    this.executorService = executorService;
-    this.buildContext = buildContext;
-  }
+    } catch (TException e) {
+      throw new RuntimeException("Failed to list all tables under namespace " + namespace, e);
 
-  /**
-   * Add steps for loading an image to docker daemon.
-   *
-   * @param dockerClient the docker client to load the image to
-   * @return this
-   */
-  public StepsRunner dockerLoadSteps(DockerClient dockerClient) {
-    rootProgressDescription = "building image to Docker daemon";
-
-    addRetrievalSteps(true); // always pull layers for docker builds
-    stepsToRun.add(this::buildAndCacheApplicationLayers);
-    stepsToRun.add(this::buildImages);
-
-    // load to Docker
-    stepsToRun.add(
-        progressDispatcherFactory -> loadDocker(dockerClient, progressDispatcherFactory));
-    return this;
-  }
-
-  /**
-   * Add steps for writing an image as a tar file archive.
-   *
-   * @param outputPath the target file path to write the image to
-   * @return this
-   */
-  public StepsRunner tarBuildSteps(Path outputPath) {
-    rootProgressDescription = "building image to tar file";
-
-    addRetrievalSteps(true); // always pull layers for tar builds
-    stepsToRun.add(this::buildAndCacheApplicationLayers);
-    stepsToRun.add(this::buildImages);
-
-    // create a tar
-    stepsToRun.add(
-        progressDispatcherFactory -> writeTarFile(outputPath, progressDispatcherFactory));
-    return this;
-  }
-
-  /**
-   * Add steps for pushing images to a remote registry. The registry is determined by the image
-   * name.
-   *
-   * @return this
-   */
-  public StepsRunner registryPushSteps() {
-    rootProgressDescription = "building images to registry";
-    boolean layersRequiredLocally = buildContext.getAlwaysCacheBaseImage();
-
-    stepsToRun.add(this::authenticateBearerPush);
-
-    addRetrievalSteps(layersRequiredLocally);
-    stepsToRun.add(this::buildAndCacheApplicationLayers);
-    stepsToRun.add(this::buildImages);
-    stepsToRun.add(this::buildManifestListOrSingleManifest);
-
-    // push to registry
-    stepsToRun.add(this::pushBaseImagesLayers);
-    stepsToRun.add(this::pushApplicationLayers);
-    stepsToRun.add(this::pushContainerConfigurations);
-    stepsToRun.add(this::checkManifestInTargetRegistry);
-    stepsToRun.add(this::pushImages);
-    stepsToRun.add(this::pushManifestList);
-    return this;
-  }
-
-  /**
-   * Run all steps and return a BuildResult after a build is completed.
-   *
-   * @return a {@link BuildResult} with build metadata
-   * @throws ExecutionException if an error occurred during asynchronous execution of steps
-   * @throws InterruptedException if the build was interrupted while waiting for results
-   */
-  public BuildResult run() throws ExecutionException, InterruptedException {
-    Preconditions.checkNotNull(rootProgressDescription);
-
-    try (ProgressEventDispatcher progressEventDispatcher =
-        ProgressEventDispatcher.newRoot(
-            buildContext.getEventHandlers(), rootProgressDescription, stepsToRun.size())) {
-      stepsToRun.forEach(step -> step.accept(progressEventDispatcher.newChildProducer()));
-      return results.buildResult.get();
-
-    } catch (ExecutionException ex) {
-      ExecutionException unrolled = ex;
-      while (unrolled.getCause() instanceof ExecutionException) {
-        unrolled = (ExecutionException) unrolled.getCause();
-      }
-      throw unrolled;
-
-    } finally {
-      tempDirectoryProvider.close();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted in call to listTables", e);
     }
   }
 
-  private void addRetrievalSteps(boolean layersRequiredLocally) {
-    ImageConfiguration baseImageConfiguration = buildContext.getBaseImageConfiguration();
+  @Override
+  public String name() {
+    return name;
+  }
 
-    if (baseImageConfiguration.getTarPath().isPresent()) {
-      // If tarPath is present, a TarImage was used
-      stepsToRun.add(this::extractTar);
+  @Override
+  public boolean dropTable(TableIdentifier identifier, boolean purge) {
+    if (!isValidIdentifier(identifier)) {
+      return false;
+    }
 
-    } else if (baseImageConfiguration.getDockerClient().isPresent()) {
-      // If dockerClient is present, a DockerDaemonImage was used
-      stepsToRun.add(this::saveDocker);
+    String database = identifier.namespace().level(0);
 
+    TableOperations ops = newTableOps(identifier);
+    TableMetadata lastMetadata;
+    if (purge && ops.current() != null) {
+      lastMetadata = ops.current();
     } else {
-      // Otherwise default to RegistryImage
-      stepsToRun.add(this::pullBaseImages);
-      stepsToRun.add(
-          progressDispatcherFactory ->
-              obtainBaseImagesLayers(layersRequiredLocally, progressDispatcherFactory));
+      lastMetadata = null;
     }
-  }
 
-  private void authenticateBearerPush(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.targetRegistryClient =
-        executorService.submit(new AuthenticatePushStep(buildContext, progressDispatcherFactory));
-  }
+    try {
+      clients.run(client -> {
+        client.dropTable(database, identifier.name(),
+            false /* do not delete data */,
+            false /* throw NoSuchObjectException if the table doesn't exist */);
+        return null;
+      });
 
-  private void saveDocker(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    Optional<DockerClient> dockerClient =
-        buildContext.getBaseImageConfiguration().getDockerClient();
-    Preconditions.checkArgument(dockerClient.isPresent());
-
-    assignLocalImageResult(
-        executorService.submit(
-            LocalBaseImageSteps.retrieveDockerDaemonLayersStep(
-                buildContext,
-                progressDispatcherFactory,
-                dockerClient.get(),
-                tempDirectoryProvider)));
-  }
-
-  private void extractTar(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    Optional<Path> tarPath = buildContext.getBaseImageConfiguration().getTarPath();
-    Preconditions.checkArgument(tarPath.isPresent());
-
-    assignLocalImageResult(
-        executorService.submit(
-            LocalBaseImageSteps.retrieveTarLayersStep(
-                buildContext, progressDispatcherFactory, tarPath.get(), tempDirectoryProvider)));
-  }
-
-  private void assignLocalImageResult(Future<LocalImage> localImage) {
-    results.baseImagesAndRegistryClient =
-        executorService.submit(
-            () ->
-                LocalBaseImageSteps.returnImageAndRegistryClientStep(
-                        realizeFutures(localImage.get().layers),
-                        localImage.get().configurationTemplate)
-                    .call());
-
-    results.baseImagesAndLayers =
-        executorService.submit(
-            () ->
-                Collections.singletonMap(
-                    results.baseImagesAndRegistryClient.get().images.get(0),
-                    localImage.get().layers));
-  }
-
-  @VisibleForTesting
-  void pullBaseImages(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.baseImagesAndRegistryClient =
-        executorService.submit(new PullBaseImageStep(buildContext, progressDispatcherFactory));
-  }
-
-  private void obtainBaseImagesLayers(
-      boolean layersRequiredLocally, ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.baseImagesAndLayers =
-        executorService.submit(
-            () -> {
-              try (ProgressEventDispatcher progressDispatcher =
-                  progressDispatcherFactory.create(
-                      "scheduling obtaining base images layers",
-                      results.baseImagesAndRegistryClient.get().images.size())) {
-
-                Map<DescriptorDigest, Future<PreparedLayer>> preparedLayersCache = new HashMap<>();
-                Map<Image, List<Future<PreparedLayer>>> baseImagesAndLayers = new LinkedHashMap<>();
-                for (Image baseImage : results.baseImagesAndRegistryClient.get().images) {
-                  List<Future<PreparedLayer>> layers =
-                      obtainBaseImageLayers(
-                          baseImage,
-                          layersRequiredLocally,
-                          preparedLayersCache,
-                          progressDispatcher.newChildProducer());
-                  baseImagesAndLayers.put(baseImage, layers);
-                }
-                return baseImagesAndLayers;
-              }
-            });
-  }
-
-  // This method updates the given "preparedLayersCache" and should not be called concurrently.
-  @VisibleForTesting
-  List<Future<PreparedLayer>> obtainBaseImageLayers(
-      Image baseImage,
-      boolean layersRequiredLocally,
-      Map<DescriptorDigest, Future<PreparedLayer>> preparedLayersCache,
-      ProgressEventDispatcher.Factory progressDispatcherFactory)
-      throws InterruptedException, ExecutionException {
-    List<Future<PreparedLayer>> preparedLayers = new ArrayList<>();
-
-    try (ProgressEventDispatcher progressDispatcher =
-        progressDispatcherFactory.create(
-            "launching base image layer pullers", baseImage.getLayers().size())) {
-      for (Layer layer : baseImage.getLayers()) {
-        DescriptorDigest digest = layer.getBlobDescriptor().getDigest();
-        Future<PreparedLayer> preparedLayer = preparedLayersCache.get(digest);
-
-        if (preparedLayer != null) {
-          progressDispatcher.dispatchProgress(1);
-        } else { // If we haven't obtained this layer yet, launcher a puller.
-          preparedLayer =
-              executorService.submit(
-                  layersRequiredLocally
-                      ? ObtainBaseImageLayerStep.forForcedDownload(
-                          buildContext,
-                          progressDispatcher.newChildProducer(),
-                          layer,
-                          results.baseImagesAndRegistryClient.get().registryClient)
-                      : ObtainBaseImageLayerStep.forSelectiveDownload(
-                          buildContext,
-                          progressDispatcher.newChildProducer(),
-                          layer,
-                          results.baseImagesAndRegistryClient.get().registryClient,
-                          results.targetRegistryClient.get()));
-          preparedLayersCache.put(digest, preparedLayer);
-        }
-        preparedLayers.add(preparedLayer);
+      if (purge && lastMetadata != null) {
+        CatalogUtil.dropTableData(ops.io(), lastMetadata);
       }
-      return preparedLayers;
+
+      LOG.info("Dropped table: {}", identifier);
+      return true;
+
+    } catch (NoSuchTableException | NoSuchObjectException e) {
+      LOG.info("Skipping drop, table does not exist: {}", identifier, e);
+      return false;
+
+    } catch (TException e) {
+      throw new RuntimeException("Failed to drop " + identifier, e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted in call to dropTable", e);
     }
   }
 
-  private void pushBaseImagesLayers(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.baseImagesAndLayerPushResults =
-        executorService.submit(
-            () -> {
-              try (ProgressEventDispatcher progressDispatcher =
-                  progressDispatcherFactory.create(
-                      "scheduling pushing base images layers",
-                      results.baseImagesAndLayers.get().size())) {
+  @Override
+  public void renameTable(TableIdentifier from, TableIdentifier originalTo) {
+    if (!isValidIdentifier(from)) {
+      throw new NoSuchTableException("Invalid identifier: %s", from);
+    }
 
-                Map<Image, List<Future<BlobDescriptor>>> layerPushResults = new LinkedHashMap<>();
-                for (Map.Entry<Image, List<Future<PreparedLayer>>> entry :
-                    results.baseImagesAndLayers.get().entrySet()) {
-                  Image baseImage = entry.getKey();
-                  List<Future<PreparedLayer>> baseLayers = entry.getValue();
+    TableIdentifier to = removeCatalogName(originalTo);
+    Preconditions.checkArgument(isValidIdentifier(to), "Invalid identifier: %s", to);
 
-                  List<Future<BlobDescriptor>> pushResults =
-                      pushBaseImageLayers(baseLayers, progressDispatcher.newChildProducer());
-                  layerPushResults.put(baseImage, pushResults);
-                }
-                return layerPushResults;
-              }
-            });
+    String toDatabase = to.namespace().level(0);
+    String fromDatabase = from.namespace().level(0);
+    String fromName = from.name();
+
+    try {
+      Table table = clients.run(client -> client.getTable(fromDatabase, fromName));
+      HiveTableOperations.validateTableIsIceberg(table, fullTableName(name, from));
+
+      table.setDbName(toDatabase);
+      table.setTableName(to.name());
+
+      clients.run(client -> {
+        client.alter_table(fromDatabase, fromName, table);
+        return null;
+      });
+
+      LOG.info("Renamed table from {}, to {}", from, to);
+
+    } catch (NoSuchObjectException e) {
+      throw new NoSuchTableException("Table does not exist: %s", from);
+
+    } catch (AlreadyExistsException e) {
+      throw new org.apache.iceberg.exceptions.AlreadyExistsException("Table already exists: %s", to);
+
+    } catch (TException e) {
+      throw new RuntimeException("Failed to rename " + from + " to " + to, e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted in call to rename", e);
+    }
   }
 
-  private List<Future<BlobDescriptor>> pushBaseImageLayers(
-      List<Future<PreparedLayer>> baseLayers,
-      ProgressEventDispatcher.Factory progressDispatcherFactory)
-      throws InterruptedException, ExecutionException {
-    return scheduleCallables(
-        PushLayerStep.makeList(
-            buildContext,
-            progressDispatcherFactory,
-            results.targetRegistryClient.get(),
-            baseLayers));
+  @Override
+  public void createNamespace(Namespace namespace, Map<String, String> meta) {
+    Preconditions.checkArgument(
+        !namespace.isEmpty(),
+        "Cannot create namespace with invalid name: %s", namespace);
+    Preconditions.checkArgument(isValidateNamespace(namespace),
+        "Cannot support multi part namespace in Hive MetaStore: %s", namespace);
+
+    try {
+      clients.run(client -> {
+        client.createDatabase(convertToDatabase(namespace, meta));
+        return null;
+      });
+
+      LOG.info("Created namespace: {}", namespace);
+
+    } catch (AlreadyExistsException e) {
+      throw new org.apache.iceberg.exceptions.AlreadyExistsException(e, "Namespace '%s' already exists!",
+            namespace);
+
+    } catch (TException e) {
+      throw new RuntimeException("Failed to create namespace " + namespace + " in Hive MataStore", e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException(
+          "Interrupted in call to createDatabase(name) " + namespace + " in Hive MataStore", e);
+    }
   }
 
-  private void buildAndCacheApplicationLayers(
-      ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.applicationLayers =
-        scheduleCallables(
-            BuildAndCacheApplicationLayerStep.makeList(buildContext, progressDispatcherFactory));
+  @Override
+  public List<Namespace> listNamespaces(Namespace namespace) {
+    if (!isValidateNamespace(namespace) && !namespace.isEmpty()) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+    }
+    if (!namespace.isEmpty()) {
+      return ImmutableList.of();
+    }
+    try {
+      List<Namespace> namespaces = clients.run(HiveMetaStoreClient::getAllDatabases)
+          .stream()
+          .map(Namespace::of)
+          .collect(Collectors.toList());
+
+      LOG.debug("Listing namespace {} returned tables: {}", namespace, namespaces);
+      return namespaces;
+
+    } catch (TException e) {
+      throw new RuntimeException("Failed to list all namespace: " + namespace + " in Hive MataStore",  e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException(
+          "Interrupted in call to getAllDatabases() " + namespace + " in Hive MataStore", e);
+    }
   }
 
-  private void buildImages(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.baseImagesAndBuiltImages =
-        executorService.submit(
-            () -> {
-              try (ProgressEventDispatcher progressDispatcher =
-                  progressDispatcherFactory.create(
-                      "scheduling building manifests", results.baseImagesAndLayers.get().size())) {
+  @Override
+  public boolean dropNamespace(Namespace namespace) {
+    if (!isValidateNamespace(namespace)) {
+      return false;
+    }
 
-                Map<Image, Future<Image>> baseImagesAndBuiltImages = new LinkedHashMap<>();
-                for (Map.Entry<Image, List<Future<PreparedLayer>>> entry :
-                    results.baseImagesAndLayers.get().entrySet()) {
-                  Image baseImage = entry.getKey();
-                  List<Future<PreparedLayer>> baseLayers = entry.getValue();
+    try {
+      clients.run(client -> {
+        client.dropDatabase(namespace.level(0),
+            false /* deleteData */,
+            false /* ignoreUnknownDb */,
+            false /* cascade */);
+        return null;
+      });
 
-                  Future<Image> builtImage =
-                      buildImage(baseImage, baseLayers, progressDispatcher.newChildProducer());
-                  baseImagesAndBuiltImages.put(baseImage, builtImage);
-                }
-                return baseImagesAndBuiltImages;
-              }
-            });
+      LOG.info("Dropped namespace: {}", namespace);
+      return true;
+
+    } catch (InvalidOperationException e) {
+      throw new NamespaceNotEmptyException(e, "Namespace %s is not empty. One or more tables exist.", namespace);
+
+    } catch (NoSuchObjectException e) {
+      return false;
+
+    } catch (TException e) {
+      throw new RuntimeException("Failed to drop namespace " + namespace + " in Hive MataStore", e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException(
+          "Interrupted in call to drop dropDatabase(name) " + namespace + " in Hive MataStore", e);
+    }
   }
 
-  private Future<Image> buildImage(
-      Image baseImage,
-      List<Future<PreparedLayer>> baseLayers,
-      ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    return executorService.submit(
-        () ->
-            new BuildImageStep(
-                    buildContext,
-                    progressDispatcherFactory,
-                    baseImage,
-                    realizeFutures(baseLayers),
-                    realizeFutures(Verify.verifyNotNull(results.applicationLayers)))
-                .call());
+  @Override
+  public boolean setProperties(Namespace namespace,  Map<String, String> properties) {
+    Map<String, String> parameter = Maps.newHashMap();
+
+    parameter.putAll(loadNamespaceMetadata(namespace));
+    parameter.putAll(properties);
+    Database database = convertToDatabase(namespace, parameter);
+
+    alterHiveDataBase(namespace, database);
+    LOG.debug("Successfully set properties {} for {}", properties.keySet(), namespace);
+
+    // Always successful, otherwise exception is thrown
+    return true;
   }
 
-  private void buildManifestListOrSingleManifest(
-      ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.manifestListOrSingleManifest =
-        executorService.submit(
-            () ->
-                new BuildManifestListOrSingleManifestStep(
-                        buildContext,
-                        progressDispatcherFactory,
-                        realizeFutures(results.baseImagesAndBuiltImages.get().values()))
-                    .call());
+  @Override
+  public boolean removeProperties(Namespace namespace,  Set<String> properties) {
+    Map<String, String> parameter = Maps.newHashMap();
+
+    parameter.putAll(loadNamespaceMetadata(namespace));
+    properties.forEach(key -> parameter.put(key, null));
+    Database database = convertToDatabase(namespace, parameter);
+
+    alterHiveDataBase(namespace, database);
+    LOG.debug("Successfully removed properties {} from {}", properties, namespace);
+
+    // Always successful, otherwise exception is thrown
+    return true;
   }
 
-  private void pushContainerConfigurations(
-      ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.baseImagesAndContainerConfigPushResults =
-        executorService.submit(
-            () -> {
-              try (ProgressEventDispatcher progressDispatcher =
-                  progressDispatcherFactory.create(
-                      "scheduling pushing container configurations",
-                      results.baseImagesAndBuiltImages.get().size())) {
+  private void alterHiveDataBase(Namespace namespace,  Database database) {
+    try {
+      clients.run(client -> {
+        client.alterDatabase(namespace.level(0), database);
+        return null;
+      });
 
-                Map<Image, Future<BlobDescriptor>> configPushResults = new LinkedHashMap<>();
-                for (Map.Entry<Image, Future<Image>> entry :
-                    results.baseImagesAndBuiltImages.get().entrySet()) {
-                  Image baseImage = entry.getKey();
-                  Future<Image> builtImage = entry.getValue();
+    } catch (NoSuchObjectException | UnknownDBException e) {
+      throw new NoSuchNamespaceException(e, "Namespace does not exist: %s", namespace);
 
-                  Future<BlobDescriptor> pushResult =
-                      pushContainerConfiguration(builtImage, progressDispatcher.newChildProducer());
-                  configPushResults.put(baseImage, pushResult);
-                }
-                return configPushResults;
-              }
-            });
+    } catch (TException e) {
+      throw new RuntimeException(
+          "Failed to list namespace under namespace: " + namespace + " in Hive MataStore", e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted in call to getDatabase(name) " + namespace + " in Hive MataStore", e);
+    }
   }
 
-  private Future<BlobDescriptor> pushContainerConfiguration(
-      Future<Image> builtImage, ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    return executorService.submit(
-        () ->
-            new PushContainerConfigurationStep(
-                    buildContext,
-                    progressDispatcherFactory,
-                    results.targetRegistryClient.get(),
-                    builtImage.get())
-                .call());
+  @Override
+  public Map<String, String> loadNamespaceMetadata(Namespace namespace) {
+    if (!isValidateNamespace(namespace)) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+    }
+
+    try {
+      Database database = clients.run(client -> client.getDatabase(namespace.level(0)));
+      Map<String, String> metadata = convertToMetadata(database);
+      LOG.debug("Loaded metadata for namespace {} found {}", namespace, metadata.keySet());
+      return metadata;
+
+    } catch (NoSuchObjectException | UnknownDBException e) {
+      throw new NoSuchNamespaceException(e, "Namespace does not exist: %s", namespace);
+
+    } catch (TException e) {
+      throw new RuntimeException("Failed to list namespace under namespace: " + namespace + " in Hive MataStore", e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException(
+          "Interrupted in call to getDatabase(name) " + namespace + " in Hive MataStore", e);
+    }
   }
 
-  private void pushApplicationLayers(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.applicationLayerPushResults =
-        executorService.submit(
-            () ->
-                scheduleCallables(
-                    PushLayerStep.makeList(
-                        buildContext,
-                        progressDispatcherFactory,
-                        results.targetRegistryClient.get(),
-                        Verify.verifyNotNull(results.applicationLayers))));
+  @Override
+  protected boolean isValidIdentifier(TableIdentifier tableIdentifier) {
+    return tableIdentifier.namespace().levels().length == 1;
   }
 
-  private void checkManifestInTargetRegistry(
-      ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.manifestCheckResult =
-        executorService.submit(
-            () ->
-                new CheckManifestStep(
-                        buildContext,
-                        progressDispatcherFactory,
-                        results.targetRegistryClient.get(),
-                        results.manifestListOrSingleManifest.get())
-                    .call());
+  private TableIdentifier removeCatalogName(TableIdentifier to) {
+    if (isValidIdentifier(to)) {
+      return to;
+    }
+
+    // check if the identifier includes the catalog name and remove it
+    if (to.namespace().levels().length == 2 && name().equalsIgnoreCase(to.namespace().level(0))) {
+      return TableIdentifier.of(Namespace.of(to.namespace().level(1)), to.name());
+    }
+
+    // return the original unmodified
+    return to;
   }
 
-  private void pushImages(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.imagePushResults =
-        executorService.submit(
-            () -> {
-              try (ProgressEventDispatcher progressDispatcher =
-                  progressDispatcherFactory.create(
-                      "scheduling pushing manifests",
-                      results.baseImagesAndBuiltImages.get().size())) {
-
-                realizeFutures(results.applicationLayerPushResults.get());
-
-                List<Future<BuildResult>> buildResults = new ArrayList<>();
-                for (Map.Entry<Image, Future<Image>> entry :
-                    results.baseImagesAndBuiltImages.get().entrySet()) {
-                  Image baseImage = entry.getKey();
-                  Future<Image> builtImage = entry.getValue();
-
-                  buildResults.add(
-                      pushImage(baseImage, builtImage, progressDispatcher.newChildProducer()));
-                }
-                return buildResults;
-              }
-            });
+  private boolean isValidateNamespace(Namespace namespace) {
+    return namespace.levels().length == 1;
   }
 
-  private Future<BuildResult> pushImage(
-      Image baseImage,
-      Future<Image> builtImage,
-      ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    return executorService.submit(
-        () -> {
-          realizeFutures(
-              Verify.verifyNotNull(results.baseImagesAndLayerPushResults.get().get(baseImage)));
-
-          Future<BlobDescriptor> containerConfigPushResult =
-              results.baseImagesAndContainerConfigPushResults.get().get(baseImage);
-
-          List<Future<BuildResult>> manifestPushResults =
-              scheduleCallables(
-                  PushImageStep.makeList(
-                      buildContext,
-                      progressDispatcherFactory,
-                      results.targetRegistryClient.get(),
-                      Verify.verifyNotNull(containerConfigPushResult).get(),
-                      builtImage.get(),
-                      results.manifestCheckResult.get().isPresent()));
-
-          realizeFutures(manifestPushResults);
-          return manifestPushResults.isEmpty()
-              ? new BuildResult(
-                  results.manifestCheckResult.get().get().getDigest(),
-                  Verify.verifyNotNull(containerConfigPushResult).get().getDigest())
-              // Manifest pushers return the same BuildResult.
-              : manifestPushResults.get(0).get();
-        });
+  @Override
+  public TableOperations newTableOps(TableIdentifier tableIdentifier) {
+    String dbName = tableIdentifier.namespace().level(0);
+    String tableName = tableIdentifier.name();
+    return new HiveTableOperations(conf, clients, fileIO, name, dbName, tableName);
   }
 
-  private void pushManifestList(ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.buildResult =
-        executorService.submit(
-            () -> {
-              realizeFutures(results.imagePushResults.get());
-              List<Future<BuildResult>> manifestListPushResults =
-                  scheduleCallables(
-                      PushImageStep.makeListForManifestList(
-                          buildContext,
-                          progressDispatcherFactory,
-                          results.targetRegistryClient.get(),
-                          results.manifestListOrSingleManifest.get(),
-                          results.manifestCheckResult.get().isPresent()));
+  @Override
+  protected String defaultWarehouseLocation(TableIdentifier tableIdentifier) {
+    // This is a little edgy since we basically duplicate the HMS location generation logic.
+    // Sadly I do not see a good way around this if we want to keep the order of events, like:
+    // - Create meta files
+    // - Create the metadata in HMS, and this way committing the changes
 
-              realizeFutures(manifestListPushResults);
-              return manifestListPushResults.isEmpty()
-                  ? results.imagePushResults.get().get(0).get()
-                  : manifestListPushResults.get(0).get();
-            });
+    // Create a new location based on the namespace / database if it is set on database level
+    try {
+      Database databaseData = clients.run(client -> client.getDatabase(tableIdentifier.namespace().levels()[0]));
+      if (databaseData.getLocationUri() != null) {
+        // If the database location is set use it as a base.
+        return String.format("%s/%s", databaseData.getLocationUri(), tableIdentifier.name());
+      }
+
+    } catch (TException e) {
+      throw new RuntimeException(String.format("Metastore operation failed for %s", tableIdentifier), e);
+
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted during commit", e);
+    }
+
+    // Otherwise stick to the {WAREHOUSE_DIR}/{DB_NAME}.db/{TABLE_NAME} path
+    String warehouseLocation = getWarehouseLocation();
+    return String.format(
+        "%s/%s.db/%s",
+        warehouseLocation,
+        tableIdentifier.namespace().levels()[0],
+        tableIdentifier.name());
   }
 
-  private void loadDocker(
-      DockerClient dockerClient, ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.buildResult =
-        executorService.submit(
-            () -> {
-              Verify.verify(
-                  results.baseImagesAndBuiltImages.get().size() == 1,
-                  "multi-platform image building not supported when pushing to Docker engine");
-              Image builtImage =
-                  results.baseImagesAndBuiltImages.get().values().iterator().next().get();
-              return new LoadDockerStep(
-                      buildContext, progressDispatcherFactory, dockerClient, builtImage)
-                  .call();
-            });
+  private String getWarehouseLocation() {
+    String warehouseLocation = conf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname);
+    Preconditions.checkNotNull(warehouseLocation, "Warehouse location is not set: hive.metastore.warehouse.dir=null");
+    return warehouseLocation;
   }
 
-  private void writeTarFile(
-      Path outputPath, ProgressEventDispatcher.Factory progressDispatcherFactory) {
-    results.buildResult =
-        executorService.submit(
-            () -> {
-              Verify.verify(
-                  results.baseImagesAndBuiltImages.get().size() == 1,
-                  "multi-platform image building not supported when building a local tar image");
-              Image builtImage =
-                  results.baseImagesAndBuiltImages.get().values().iterator().next().get();
+  private Map<String, String> convertToMetadata(Database database) {
 
-              return new WriteTarFileStep(
-                      buildContext, progressDispatcherFactory, outputPath, builtImage)
-                  .call();
-            });
+    Map<String, String> meta = Maps.newHashMap();
+
+    meta.putAll(database.getParameters());
+    meta.put("location", database.getLocationUri());
+    if (database.getDescription() != null) {
+      meta.put("comment", database.getDescription());
+    }
+
+    return meta;
   }
 
-  private <E> List<Future<E>> scheduleCallables(ImmutableList<? extends Callable<E>> callables) {
-    return callables.stream().map(executorService::submit).collect(Collectors.toList());
+  Database convertToDatabase(Namespace namespace, Map<String, String> meta) {
+    if (!isValidateNamespace(namespace)) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+    }
+
+    Database database = new Database();
+    Map<String, String> parameter = Maps.newHashMap();
+
+    database.setName(namespace.level(0));
+    database.setLocationUri(new Path(getWarehouseLocation(), namespace.level(0)).toString() + ".db");
+
+    meta.forEach((key, value) -> {
+      if (key.equals("comment")) {
+        database.setDescription(value);
+      } else if (key.equals("location")) {
+        database.setLocationUri(value);
+      } else {
+        if (value != null) {
+          parameter.put(key, value);
+        }
+      }
+    });
+    database.setParameters(parameter);
+
+    return database;
+  }
+
+  @Override
+  public void close() {
+    if (!closed) {
+      clients.close();
+      closed = true;
+    }
+  }
+
+  @SuppressWarnings("checkstyle:NoFinalizer")
+  @Override
+  protected void finalize() throws Throwable {
+    super.finalize();
+    if (!closed) {
+      close(); // releasing resources is more important than printing the warning
+      String trace = Joiner.on("\n\t").join(
+          Arrays.copyOfRange(createStack, 1, createStack.length));
+      LOG.warn("Unclosed input stream created by:\n\t{}", trace);
+    }
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("name", name)
+        .add("uri", this.conf.get(HiveConf.ConfVars.METASTOREURIS.varname))
+        .toString();
   }
 }
